@@ -75,7 +75,7 @@ export default function Footer() {
         <a
           target="_blank"
           className="flex space-x-3 hover:underline underline-offset-4"
-          href="https://github.com/itsanmol27/EduAI"
+          href="https://github.com/krishnag1606/EduAI"
           rel="noopener noreferrer"
         >
           <svg
