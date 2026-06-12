@@ -24,32 +24,155 @@ An AI-powered educational content generation platform for teachers and educators
 
 ## 1. Architecture Overview
 
-EduAI is a **two-tier monolith** with a clear client/server split:
+EduAI is a **two-tier monolith** with a clear client/server split deployed as two separate Vercel projects.
 
+**Pattern:** The backend follows a **loose MVC** style — routes act as thin controllers, all business logic lives in `utils/`, and Mongoose models are used directly in utilities. The frontend uses Next.js App Router with React Context for global user state and local `useState` for everything else.
+
+### System Architecture
+
+```mermaid
+graph TD
+    subgraph Browser["BROWSER"]
+        UI["Next.js 15 App Router\nReact 18 + TypeScript"]
+        CTX["UserContext\nReact Context + localStorage"]
+        FBSDK["Firebase JS SDK\nGoogle OAuth"]
+    end
+
+    subgraph Client["CLIENT — Vercel (Next.js)"]
+        Pages["Pages\ndashboard · sign-in · sign-up · features · home"]
+        Comps["Components\nshadcn/ui · Tailwind CSS · Recharts"]
+        Lib["lib/\nAnalysis · LessonPlan · routeProvider · utils"]
+    end
+
+    subgraph Server["SERVER — Vercel (Express.js)"]
+        direction TB
+        Routes["Routes\n/auth  /test  /doubt  /lessonPlan"]
+        subgraph Utils["utils/ — Business Logic"]
+            LLMProv["llmProvider.js\nChatGoogleGenerativeAI\ntemp=0 · maxRetries=2"]
+            GenQ["generateQuestion\ngenerateQuestionwithContext"]
+            Analyse["analyseTest\nanalyseTestusingAi"]
+            GenLP["generateLessonPlan\nsolveDoubt"]
+            OCR["extractTextFromImage\nTesseract.js WASM"]
+            Upload["uploadImage\nFirebase Admin SDK"]
+        end
+        Models["Mongoose Models\nUser · Test · Doubt · LessonPlan"]
+    end
+
+    subgraph External["EXTERNAL SERVICES"]
+        MongoDB[("MongoDB Atlas\n4 collections")]
+        Gemini["Google Gemini 1.5 Pro\nvia LangChain"]
+        FBAuth["Firebase Auth\nGoogle OAuth Provider"]
+        FBStore["Firebase Storage\ndoubt/{timestamp}"]
+    end
+
+    UI --> Pages
+    Pages --> Comps
+    Pages --> Lib
+    Pages --> CTX
+    Pages -->|"Axios REST POST\nJSON + multipart"| Routes
+
+    FBSDK -->|"signInWithPopup"| FBAuth
+    FBAuth -->|"credential"| FBSDK
+    FBSDK --> CTX
+
+    Routes --> Utils
+    LLMProv --> GenQ
+    LLMProv --> Analyse
+    LLMProv --> GenLP
+    Routes --> Models
+
+    GenQ -->|"invoke()"| Gemini
+    Analyse -->|"invoke()"| Gemini
+    GenLP -->|"invoke()"| Gemini
+    Gemini -->|"raw JSON text"| GenQ
+    Gemini -->|"raw JSON text"| Analyse
+    Gemini -->|"raw JSON text"| GenLP
+
+    OCR -->|"buffer → text"| GenLP
+    Upload -->|"buffer"| FBStore
+    FBStore -->|"download URL"| Upload
+
+    Models -->|"Mongoose ODM"| MongoDB
+    MongoDB -->|"documents"| Models
+
+    Routes -->|"JSON response"| Pages
 ```
-┌─────────────────────────────────┐     HTTP/REST      ┌──────────────────────────────────┐
-│         CLIENT (Next.js)        │ ←────────────────→ │        SERVER (Express.js)        │
-│                                 │                     │                                  │
-│  App Router + React 18          │                     │  Route handlers → Utils → LLM    │
-│  Tailwind + shadcn/ui           │                     │  Mongoose ODM → MongoDB Atlas    │
-│  Firebase Auth (Google OAuth)   │                     │  Firebase Storage (images)       │
-│  Axios for API calls            │                     │  Tesseract.js (OCR)              │
-└─────────────────────────────────┘                     └──────────────────────────────────┘
-         │                                                          │
-         │ Firebase SDK                                  Gemini API │ (via LangChain)
-         ↓                                                          ↓
-  ┌─────────────┐                                        ┌──────────────────┐
-  │  Firebase   │                                        │  Google Gemini   │
-  │  (Auth +    │                                        │   1.5 Pro        │
-  │  Storage)   │                                        └──────────────────┘
-  └─────────────┘
+
+---
+
+### MCQ Test Lifecycle — Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    actor Teacher
+    participant Dashboard as Dashboard Page<br/>(Next.js)
+    participant API as Express Server<br/>(/test routes)
+    participant LLM as Gemini 1.5 Pro<br/>(via LangChain)
+    participant DB as MongoDB Atlas
+
+    rect rgb(235, 245, 255)
+        Note over Teacher, DB: Phase 1 — Question Generation
+        Teacher->>Dashboard: Fill subject/topic/difficulty + click Generate
+        Dashboard->>API: POST /test/generate<br/>{userId, subjects, topics, difficulty, language}
+        API->>LLM: SystemMessage (role) + HumanMessage (params)
+        LLM-->>API: Raw text (possibly wrapped in ```json...```)
+        API->>API: Sanitize: strip fences → JSON.parse()
+        API->>DB: new Test({userId, questions}).save()
+        DB-->>API: Saved Test document
+        API-->>Dashboard: Test document (questions array)
+        Dashboard->>Teacher: Render MCQ modal with 5 questions
+    end
+
+    rect rgb(240, 255, 240)
+        Note over Teacher, DB: Phase 2 — Answer Submission & Scoring
+        Teacher->>Dashboard: Select answers + click Submit
+        Dashboard->>API: POST /test/submit<br/>{testId, answers: [0,2,1,3,...]}
+        API->>DB: Test.findById(testId)
+        DB-->>API: Test document
+        API->>API: Compare answers[i] vs questions[i].answer<br/>Build topicsPerformance Map
+        API->>LLM: Serialize topicsPerformance<br/>+ JEE expert analysis prompt
+        LLM-->>API: JSON {Strengths, Weaknesses,<br/>Performance_Analysis, Targeted_areas...}
+        API->>API: Sanitize + JSON.parse()
+        API->>DB: test.save() (score + topicsPerformance + summeryByAi)
+        DB-->>API: Updated Test document
+        API-->>Dashboard: Enriched Test document
+        Dashboard->>Teacher: Render Analysis view<br/>(charts + AI insights + question review)
+    end
 ```
 
-**Pattern:** The backend follows a **loose MVC** style — routes act as thin controllers, and all business logic (LLM calls, scoring, OCR, file upload) lives in a dedicated `utils/` layer. There is no service layer or repository pattern; Mongoose models are used directly in utilities.
+---
 
-The frontend is a **page-component model** using Next.js App Router. Global state is minimal (just the authenticated user) and managed via React Context. All other state is local to the page component.
+### Doubt Solver — Sequence Diagram
 
-Both client and server are deployed on **Vercel** as separate projects.
+```mermaid
+sequenceDiagram
+    actor Student
+    participant Dashboard as Dashboard Page<br/>(Next.js)
+    participant API as Express Server<br/>(/doubt/create)
+    participant OCR as Tesseract.js<br/>(WASM, server-side)
+    participant LLM as Gemini 1.5 Pro
+    participant Storage as Firebase Storage
+    participant DB as MongoDB Atlas
+
+    Student->>Dashboard: Upload image of handwritten question
+    Dashboard->>API: POST /doubt/create<br/>multipart/form-data (image buffer)
+
+    par OCR Pipeline
+        API->>OCR: createWorker("eng").recognize(buffer)
+        OCR-->>API: imageText: string
+    end
+
+    API->>LLM: solveDoubt(imageText)
+    LLM-->>API: answer: string (step-by-step solution)
+
+    API->>Storage: upload buffer to doubt/{Date.now()}
+    Storage-->>API: imageUrl (download URL)
+
+    API->>DB: new Doubt({userId, imageUrl, imageText, answer}).save()
+    DB-->>API: Doubt document
+    API-->>Dashboard: Doubt document
+    Dashboard->>Student: Display solution text
+```
 
 ---
 
